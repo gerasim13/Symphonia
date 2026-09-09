@@ -5,13 +5,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::audio::{AsGenericAudioBufferRef, Audio, AudioBuffer, GenericAudioBufferRef};
-use symphonia_core::codecs::CodecInfo;
+use symphonia_core::audio::{
+    layouts, AsGenericAudioBufferRef, Audio, AudioBuffer, AudioSpec, GenericAudioBufferRef,
+};
 use symphonia_core::codecs::audio::{
     AudioCodecId, AudioCodecParameters, AudioDecoder, AudioDecoderOptions, FinalizeResult,
 };
 use symphonia_core::codecs::registry::{RegisterableAudioDecoder, SupportedAudioCodec};
-use symphonia_core::errors::{Result, decode_error, unsupported_error};
+use symphonia_core::codecs::CodecInfo;
+use symphonia_core::errors::{decode_error, unsupported_error, Result};
 use symphonia_core::io::FiniteStream;
 use symphonia_core::packet::PacketRef;
 use symphonia_core::support_audio_codec;
@@ -79,7 +81,16 @@ impl MpaDecoder {
         // Create decoder state.
         let state = State::new(params.codec);
 
-        Ok(MpaDecoder { opts: *opts, params: params.clone(), state, buf: Default::default() })
+        let buf = match (params.sample_rate, params.channels.as_ref().map(|c| c.count())) {
+            (Some(rate), Some(1)) if rate != 0 => {
+                AudioBuffer::new(AudioSpec::new(rate, layouts::CHANNEL_LAYOUT_MONO), 1152)
+            }
+            (Some(rate), Some(2)) if rate != 0 => {
+                AudioBuffer::new(AudioSpec::new(rate, layouts::CHANNEL_LAYOUT_STEREO), 1152)
+            }
+            _ => AudioBuffer::default(),
+        };
+        Ok(MpaDecoder { opts: *opts, params: params.clone(), state, buf })
     }
 
     fn decode_inner(&mut self, packet: &PacketRef<'_>) -> Result<()> {
@@ -92,7 +103,7 @@ impl MpaDecoder {
             return decode_error("mpa: invalid packet length");
         }
 
-        // The audio buffer can only be created after the first frame is decoded.
+        // Streams without a known signal shape prepare storage from the first header.
         if self.buf.is_unused() {
             self.buf = AudioBuffer::new(header.spec(), 1152);
         }
@@ -147,7 +158,14 @@ impl AudioDecoder for MpaDecoder {
 
     fn reset(&mut self) {
         // Fully reset the decoder state.
-        self.state = State::new(self.params.codec);
+        match &mut self.state {
+            #[cfg(feature = "mp1")]
+            State::Layer1(layer) => *layer = layer1::Layer1::new(),
+            #[cfg(feature = "mp2")]
+            State::Layer2(layer) => *layer = layer2::Layer2::new(),
+            #[cfg(feature = "mp3")]
+            State::Layer3(layer) => layer.reset(),
+        }
     }
 
     fn decode_ref(&mut self, packet: &PacketRef<'_>) -> Result<GenericAudioBufferRef<'_>> {
@@ -189,5 +207,35 @@ impl RegisterableAudioDecoder for MpaDecoder {
             #[cfg(feature = "mp3")]
             support_audio_codec!(CODEC_ID_MP3, "mp3", "MPEG Audio Layer 3"),
         ]
+    }
+}
+
+#[cfg(all(test, feature = "mp3"))]
+mod tests {
+    use super::*;
+    use symphonia_core::audio::Channels;
+
+    #[test]
+    fn known_stream_shape_prepares_pcm_storage() {
+        for channels in [1, 2] {
+            let mut params = AudioCodecParameters::new();
+            params
+                .for_codec(CODEC_ID_MP3)
+                .with_sample_rate(44100)
+                .with_channels(Channels::Discrete(channels));
+            let mut decoder =
+                MpaDecoder::try_new(&params, &AudioDecoderOptions::default()).unwrap();
+            assert_eq!(decoder.buf.capacity(), 1152);
+            assert_eq!(decoder.buf.spec().channels().count(), usize::from(channels));
+            let state = match &decoder.state {
+                State::Layer3(layer) => &**layer as *const _,
+                _ => unreachable!(),
+            };
+            decoder.reset();
+            assert!(
+                matches!(&decoder.state, State::Layer3(layer) if std::ptr::eq(&**layer, state))
+            );
+            assert_eq!(decoder.buf.capacity(), 1152);
+        }
     }
 }

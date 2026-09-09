@@ -10,12 +10,12 @@
 
 use std::fmt;
 
-use crate::codecs::{CodecParameters, audio, subtitle, video};
+use crate::codecs::{audio, subtitle, video, CodecParameters};
 use crate::common::FourCc;
 use crate::errors::Result;
 use crate::io::MediaSourceStream;
 use crate::meta::{ChapterGroup, Metadata, MetadataLog};
-use crate::packet::Packet;
+use crate::packet::{Packet, PacketRef};
 use crate::units::{Duration, Time, TimeBase, Timestamp};
 
 use bitflags::bitflags;
@@ -644,6 +644,26 @@ pub trait FormatReader: Send + Sync {
     /// If `Err(ResetRequired)` is returned, then the track list must be re-examined and all
     /// `Decoder`s re-created. All other errors are unrecoverable.
     fn next_packet(&mut self) -> Result<Option<Packet>>;
+
+    /// Maximum scratch bytes required by `read_packet`, or `None` when unsupported.
+    fn packet_buffer_size(&self) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
+    /// Read into caller-owned scratch without allocating packet storage.
+    fn read_packet<'a>(&mut self, _buffer: &'a mut [u8]) -> Result<Option<PacketRef<'a>>> {
+        crate::errors::unsupported_error("borrowed packet reading is not supported")
+    }
+
+    /// Seek with caller-owned scratch storage.
+    fn seek_with_buffer(
+        &mut self,
+        mode: SeekMode,
+        to: SeekTo,
+        _buffer: &mut [u8],
+    ) -> Result<SeekedTo> {
+        self.seek(mode, to)
+    }
 
     /// Consumes the `FormatReader` and returns the underlying media source stream
     fn into_inner<'s>(self: Box<Self>) -> MediaSourceStream<'s>

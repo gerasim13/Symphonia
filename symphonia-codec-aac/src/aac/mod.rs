@@ -14,12 +14,12 @@
 use symphonia_core::audio::{
     AsGenericAudioBufferRef, AudioBuffer, AudioSpec, GenericAudioBufferRef,
 };
-use symphonia_core::codecs::CodecInfo;
 use symphonia_core::codecs::audio::well_known::CODEC_ID_AAC;
 use symphonia_core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
 use symphonia_core::codecs::audio::{AudioDecoder, FinalizeResult};
 use symphonia_core::codecs::registry::{RegisterableAudioDecoder, SupportedAudioCodec};
-use symphonia_core::errors::{Result, unsupported_error};
+use symphonia_core::codecs::CodecInfo;
+use symphonia_core::errors::{unsupported_error, Result};
 use symphonia_core::io::{BitReaderLtr, FiniteBitStream, ReadBitsLtr};
 use symphonia_core::packet::PacketRef;
 use symphonia_core::{codec_profile, support_audio_codec};
@@ -103,12 +103,20 @@ impl AacDecoder {
 
         let sbinfo = GASubbandInfo::find(asc.sample_rate);
 
+        let pairs = Vec::with_capacity(channels.count());
         let buf = AudioBuffer::new(AudioSpec::new(asc.sample_rate, channels), asc.samples);
 
-        Ok(AacDecoder { asc, pairs: Vec::new(), dsp: dsp::Dsp::new(), sbinfo, params, buf })
+        lazy_static::initialize(&codebooks::QUADS);
+        lazy_static::initialize(&codebooks::PAIRS);
+        lazy_static::initialize(&codebooks::ESC);
+        lazy_static::initialize(&codebooks::SCALEFACTORS);
+        Ok(AacDecoder { asc, pairs, dsp: dsp::Dsp::new(), sbinfo, params, buf })
     }
 
     fn set_pair(&mut self, pair_no: usize, channel: usize, pair: bool) -> Result<()> {
+        let max_channels = self.asc.channels.as_ref().map_or(0, |channels| channels.count());
+        validate!(if pair { channel + 1 } else { channel } < max_channels);
+        validate!(pair_no <= self.pairs.len() && pair_no < max_channels);
         if self.pairs.len() <= pair_no {
             self.pairs.push(cpe::ChannelPair::new(pair, channel, self.sbinfo));
         }
@@ -116,9 +124,6 @@ impl AacDecoder {
             validate!(self.pairs[pair_no].channel == channel);
             validate!(self.pairs[pair_no].is_pair == pair);
         }
-
-        let max_channels = self.asc.channels.as_ref().map_or(0, |channels| channels.count());
-        validate!(if pair { channel + 1 } else { channel } < max_channels);
 
         Ok(())
     }

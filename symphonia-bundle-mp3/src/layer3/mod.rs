@@ -8,7 +8,7 @@
 use std::fmt;
 
 use symphonia_core::audio::{AudioBuffer, AudioMut};
-use symphonia_core::errors::{Error, Result, decode_error};
+use symphonia_core::errors::{decode_error, Error, Result};
 use symphonia_core::io::{BitReaderLtr, BufReader, ReadBitsLtr, ReadBytes};
 
 mod bitstream;
@@ -260,12 +260,27 @@ pub struct Layer3 {
 
 impl Layer3 {
     pub fn new() -> Self {
+        lazy_static::initialize(&requantize::POW43);
+        lazy_static::initialize(&hybrid_synthesis::IMDCT_WINDOWS);
+        lazy_static::initialize(&hybrid_synthesis::IMDCT_HALF_COS_12);
+        lazy_static::initialize(&hybrid_synthesis::ANTIALIAS_CS_CA);
+        lazy_static::initialize(&stereo::INTENSITY_STEREO_RATIOS_MPEG2);
+        lazy_static::initialize(&stereo::INTENSITY_STEREO_RATIOS_MPEG1);
+        lazy_static::initialize(&codebooks::CODEBOOK_TABLES);
+        lazy_static::initialize(&codebooks::QUADS_CODEBOOK_TABLE);
         Self {
             samples: [[[0f32; 576]; 2]; 2],
             overlap: [[[0f32; 18]; 32]; 2],
             synthesis: Default::default(),
             resevoir: BitResevoir::new(),
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.samples = [[[0.0; 576]; 2]; 2];
+        self.overlap = [[[0.0; 18]; 32]; 2];
+        self.synthesis = Default::default();
+        self.resevoir.clear();
     }
 
     /// Reads the main_data portion of a MPEG audio frame from a `BitStream` into `FrameData`.

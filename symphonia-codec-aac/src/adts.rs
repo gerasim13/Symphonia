@@ -5,14 +5,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::errors::{Error, unsupported_error};
-use symphonia_core::support_format;
+use symphonia_core::errors::{unsupported_error, Error};
+use symphonia_core::{packet::PacketRef, support_format};
 
 use symphonia_core::audio::Channels;
-use symphonia_core::codecs::CodecParameters;
-use symphonia_core::codecs::audio::AudioCodecParameters;
 use symphonia_core::codecs::audio::well_known::CODEC_ID_AAC;
-use symphonia_core::errors::{Result, SeekErrorKind, decode_error, seek_error};
+use symphonia_core::codecs::audio::AudioCodecParameters;
+use symphonia_core::codecs::CodecParameters;
+use symphonia_core::errors::{decode_error, seek_error, Result, SeekErrorKind};
 use symphonia_core::formats::prelude::*;
 use symphonia_core::formats::probe::{ProbeFormatData, ProbeableFormat, Score, Scoreable};
 use symphonia_core::formats::well_known::FORMAT_ID_ADTS;
@@ -276,6 +276,56 @@ impl FormatReader for AdtsReader<'_> {
 
     fn media_info(&self) -> &MediaInfo {
         &self.media_info
+    }
+
+    fn packet_buffer_size(&self) -> Result<Option<usize>> {
+        Ok(Some((1 << 13) - 1))
+    }
+
+    fn read_packet<'a>(&mut self, buffer: &'a mut [u8]) -> Result<Option<PacketRef<'a>>> {
+        let checkpoint = self.reader.pos();
+        let outcome = (|| {
+            let header = match AdtsHeader::read(&mut self.reader) {
+                Ok(header) => header,
+                Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error),
+            };
+            let len = usize::from(header.payload_len());
+            if len > buffer.len() {
+                return decode_error("adts: packet scratch too small");
+            }
+            let timestamp = self.next_packet_ts;
+            let Some(next) = timestamp.checked_add(SAMPLES_PER_AAC_PACKET)
+            else {
+                return Ok(None);
+            };
+            let read = self.reader.read_buf(&mut buffer[..len])?;
+            if read != len {
+                return decode_error("adts: truncated packet");
+            }
+            self.next_packet_ts = next;
+            Ok(Some((timestamp, len)))
+        })();
+        match outcome {
+            Err(Error::IoError(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if self.reader.seek_buffered(checkpoint) != checkpoint {
+                    return decode_error("adts: packet rollback exceeded buffer");
+                }
+                Err(Error::IoError(error))
+            }
+            result => result.map(|packet| {
+                packet.map(|(timestamp, len)| {
+                    PacketRef::new(0, timestamp, SAMPLES_PER_AAC_PACKET, &buffer[..len])
+                })
+            }),
+        }
     }
 
     fn next_packet(&mut self) -> Result<Option<Packet>> {

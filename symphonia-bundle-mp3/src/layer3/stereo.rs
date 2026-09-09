@@ -5,11 +5,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::errors::{Result, decode_error};
+use symphonia_core::errors::{decode_error, Result};
 
 use crate::common::{ChannelMode, FrameHeader, Mode};
 
-use super::{Granule, common::*};
+use super::{common::*, Granule};
 
 use std::cmp::max;
 use std::{f32, f64};
@@ -56,7 +56,7 @@ lazy_static! {
     /// The first dimension of this table is indexed by scalefac_compress & 1 to select i0. The
     /// second dimension is indexed by is_pos to obtain the channel coefficients. Note that
     /// is_pos == 31 is considered an invalid position, but IS included in the table.
-    static ref INTENSITY_STEREO_RATIOS_MPEG2: [[(f32, f32); 32]; 2] = {
+    pub(super) static ref INTENSITY_STEREO_RATIOS_MPEG2: [[(f32, f32); 32]; 2] = {
         let is_scale: [f64; 2] = [
             1.0 / f64::sqrt(f64::consts::SQRT_2),
             f64::consts::FRAC_1_SQRT_2,
@@ -102,7 +102,7 @@ lazy_static! {
     ///
     /// This table is indexed by is_pos. Note that is_pos == 7 is invalid and is NOT included in the
     /// table.
-    static ref INTENSITY_STEREO_RATIOS_MPEG1: [(f32, f32); 7] = {
+    pub(super) static ref INTENSITY_STEREO_RATIOS_MPEG1: [(f32, f32); 7] = {
         const PI_12: f64 = f64::consts::PI / 12.0;
 
         let mut ratios = [(0.0, 0.0); 7];

@@ -16,7 +16,7 @@ use symphonia_core::codecs::audio::well_known::{
     CODEC_ID_PCM_F64BE, CODEC_ID_PCM_F64LE,
 };
 use symphonia_core::codecs::audio::{AudioCodecId, AudioCodecParameters};
-use symphonia_core::errors::{Result, decode_error};
+use symphonia_core::errors::{decode_error, Result};
 use symphonia_core::formats::prelude::*;
 use symphonia_core::io::{MediaSourceStream, ReadBytes};
 
@@ -391,13 +391,13 @@ impl PacketInfo {
     }
 }
 
-pub fn next_packet(
+fn next_packet_info(
     reader: &mut MediaSourceStream<'_>,
     packet_info: &PacketInfo,
     tracks: &[Track],
     data_start_pos: u64,
     data_end_pos: u64,
-) -> Result<Option<Packet>> {
+) -> Result<Option<(symphonia_core::units::Timestamp, Duration, usize)>> {
     let pos = reader.pos();
     if tracks.is_empty() {
         return decode_error("riff: no tracks");
@@ -423,10 +423,44 @@ pub fn next_packet(
     let dur = Duration::from(blocks_per_packet * packet_info.frames_per_block.get());
     let pkt_len = blocks_per_packet * packet_info.block_size.get();
 
-    // Copy the frames.
-    let packet_buf = reader.read_boxed_slice(pkt_len as usize)?;
+    let len = usize::try_from(pkt_len)
+        .map_err(|_| symphonia_core::errors::Error::DecodeError("riff: packet length overflow"))?;
+    Ok(Some((pts, dur, len)))
+}
 
-    Ok(Some(Packet::new(0, pts, dur, packet_buf)))
+pub fn next_packet(
+    reader: &mut MediaSourceStream<'_>,
+    packet_info: &PacketInfo,
+    tracks: &[Track],
+    data_start_pos: u64,
+    data_end_pos: u64,
+) -> Result<Option<Packet>> {
+    let Some((pts, dur, len)) =
+        next_packet_info(reader, packet_info, tracks, data_start_pos, data_end_pos)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Packet::new(0, pts, dur, reader.read_boxed_slice(len)?)))
+}
+
+pub fn next_packet_ref<'a>(
+    reader: &mut MediaSourceStream<'_>,
+    packet_info: &PacketInfo,
+    tracks: &[Track],
+    data_start_pos: u64,
+    data_end_pos: u64,
+    buffer: &'a mut [u8],
+) -> Result<Option<symphonia_core::packet::PacketRef<'a>>> {
+    let Some((pts, dur, len)) =
+        next_packet_info(reader, packet_info, tracks, data_start_pos, data_end_pos)?
+    else {
+        return Ok(None);
+    };
+    if len > buffer.len() {
+        return decode_error("riff: packet scratch too small");
+    }
+    let read = reader.read_buf(&mut buffer[..len])?;
+    Ok(Some(symphonia_core::packet::PacketRef::new(0, pts, dur, &buffer[..read])))
 }
 
 /// TODO: format here refers to format chunk in Wave terminology, but the data being handled here is

@@ -10,7 +10,7 @@
 
 use crate::common::FrameHeader;
 
-use super::{GranuleChannel, common::*};
+use super::{common::*, GranuleChannel};
 
 use std::{convert::TryInto, f64};
 
@@ -50,7 +50,7 @@ lazy_static! {
     /// W[12..18] = 1.0
     /// W[18..36] = sin(PI/36.0 * (i + 0.5))
     /// ```
-    static ref IMDCT_WINDOWS: [[f32; 36]; 4] = {
+    pub(super) static ref IMDCT_WINDOWS: [[f32; 36]; 4] = {
         const PI_36: f64 = f64::consts::PI / 36.0;
         const PI_12: f64 = f64::consts::PI / 12.0;
 
@@ -102,7 +102,7 @@ lazy_static! {
     /// ```
     /// where:
     ///     `N=12`, `i=N/4..3N/4`, and `k=0..N/2`.
-    static ref IMDCT_HALF_COS_12: [[f32; 6]; 6] = {
+    pub(super) static ref IMDCT_HALF_COS_12: [[f32; 6]; 6] = {
         const PI_24: f64 = f64::consts::PI / 24.0;
 
         let mut cos = [[0f32; 6]; 6];
@@ -133,7 +133,7 @@ lazy_static! {
     /// ```text
     /// c[i] = [ -0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037 ]
     /// ```
-    static ref ANTIALIAS_CS_CA: ([f32; 8], [f32; 8]) = {
+    pub(super) static ref ANTIALIAS_CS_CA: ([f32; 8], [f32; 8]) = {
         const C: [f64; 8] = [ -0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037 ];
 
         let mut cs = [0f32; 8];
@@ -481,8 +481,8 @@ pub fn frequency_inversion(samples: &mut [f32; 576]) {
 
 #[cfg(test)]
 mod tests {
-    use super::IMDCT_WINDOWS;
     use super::imdct12_win;
+    use super::IMDCT_WINDOWS;
     use std::f64;
 
     fn imdct12_analytical(x: &[f32; 6]) -> [f32; 12] {
