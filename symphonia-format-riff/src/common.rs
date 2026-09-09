@@ -16,9 +16,9 @@ use symphonia_core::codecs::audio::well_known::{
     CODEC_ID_PCM_F64BE, CODEC_ID_PCM_F64LE,
 };
 use symphonia_core::codecs::audio::{AudioCodecId, AudioCodecParameters};
-use symphonia_core::errors::{decode_error, Result};
+use symphonia_core::errors::{Result, decode_error};
 use symphonia_core::formats::prelude::*;
-use symphonia_core::io::{MediaSourceStream, ReadBytes};
+use symphonia_core::io::{MediaSourceStream, ReadBytes, SeekBuffered};
 
 use log::{debug, info};
 
@@ -335,6 +335,14 @@ pub struct PacketInfo {
 }
 
 impl PacketInfo {
+    pub fn max_packet_bytes(&self) -> Result<usize> {
+        self.block_size
+            .get()
+            .checked_mul(self.max_blocks_per_packet.get())
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or(symphonia_core::errors::Error::DecodeError("riff: packet length overflow"))
+    }
+
     pub fn with_blocks(block_size: u16, frames_per_block: u64) -> Result<Self> {
         // Frames/block must be non-zero.
         let frames_per_block = match NonZero::new(frames_per_block) {
@@ -459,7 +467,16 @@ pub fn next_packet_ref<'a>(
     if len > buffer.len() {
         return decode_error("riff: packet scratch too small");
     }
-    let read = reader.read_buf(&mut buffer[..len])?;
+    let checkpoint = reader.pos();
+    let read = match reader.read_buf(&mut buffer[..len]) {
+        Ok(read) => read,
+        Err(error) => {
+            if reader.seek_buffered(checkpoint) != checkpoint {
+                return decode_error("riff: packet rollback exceeded the seekback buffer");
+            }
+            return Err(error.into());
+        }
+    };
     Ok(Some(symphonia_core::packet::PacketRef::new(0, pts, dur, &buffer[..read])))
 }
 

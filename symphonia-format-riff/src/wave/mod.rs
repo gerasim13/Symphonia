@@ -7,10 +7,10 @@
 
 use std::io::{Seek, SeekFrom};
 
-use symphonia_core::codecs::audio::AudioCodecParameters;
 use symphonia_core::codecs::CodecParameters;
-use symphonia_core::errors::{decode_error, seek_error, unsupported_error};
+use symphonia_core::codecs::audio::AudioCodecParameters;
 use symphonia_core::errors::{Error, Result, SeekErrorKind};
+use symphonia_core::errors::{decode_error, seek_error, unsupported_error};
 use symphonia_core::formats::prelude::*;
 use symphonia_core::formats::probe::{ProbeFormatData, ProbeableFormat, Score, Scoreable};
 use symphonia_core::formats::well_known::FORMAT_ID_WAVE;
@@ -22,7 +22,7 @@ use symphonia_core::support_format;
 use log::{debug, error};
 
 use crate::common::{
-    append_data_params, append_format_params, next_packet, ByteOrder, ChunksReader, PacketInfo,
+    ByteOrder, ChunksReader, PacketInfo, append_data_params, append_format_params, next_packet,
 };
 mod chunks;
 use chunks::*;
@@ -163,6 +163,7 @@ impl<'s> WavReader<'s> {
                         append_data_params(&mut track, u64::from(data_len), &packet_info);
                     }
 
+                    mss.ensure_seekback_buffer(packet_info.max_packet_bytes()?);
                     // Instantiate the reader.
                     return Ok(WavReader {
                         reader: mss,
@@ -237,14 +238,7 @@ impl FormatReader for WavReader<'_> {
     }
 
     fn packet_buffer_size(&self) -> Result<Option<usize>> {
-        let bytes = self
-            .packet_info
-            .block_size
-            .get()
-            .checked_mul(self.packet_info.max_blocks_per_packet.get())
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .ok_or(symphonia_core::errors::Error::DecodeError("riff: packet length overflow"))?;
-        Ok(Some(bytes))
+        self.packet_info.max_packet_bytes().map(Some)
     }
 
     fn read_packet<'a>(
