@@ -864,6 +864,17 @@ impl<R: ReadAtom> AtomIterator<R> {
         Ok(data)
     }
 
+    /// Read a sample into caller-owned storage without allocating.
+    pub(crate) fn read_raw_slice_exact(&mut self, pos: u64, data: &mut [u8]) -> Result<()>
+    where
+        R: MediaSource,
+    {
+        let _ = self.pending.as_ref().ok_or(AtomError::NoPendingAtom)?;
+        self.seek_reader(pos)?;
+        ReadBytes::read_buf_exact(&mut self.reader, data)?;
+        Ok(())
+    }
+
     //
     // Reading primitives
     //

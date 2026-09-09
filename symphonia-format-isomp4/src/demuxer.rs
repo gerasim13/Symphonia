@@ -16,6 +16,7 @@ use symphonia_core::formats::probe::{ProbeFormatData, ProbeableFormat, Score, Sc
 use symphonia_core::formats::well_known::FORMAT_ID_ISOMP4;
 use symphonia_core::io::*;
 use symphonia_core::meta::{Metadata, MetadataLog};
+use symphonia_core::packet::PacketRef;
 use symphonia_core::units::Time;
 
 use std::collections::HashMap;
@@ -23,6 +24,7 @@ use std::io::{Seek, SeekFrom};
 use std::num::NonZero;
 use std::sync::Arc;
 
+use crate::atoms::stsz::SampleSize;
 use crate::atoms::{AtomError, AtomIterator, AtomType, ReadAtom};
 use crate::atoms::{FtypAtom, MetaAtom, MoofAtom, MoovAtom, SidxAtom, TrakAtom};
 use crate::stream::*;
@@ -401,9 +403,9 @@ impl<'s> IsoMp4Reader<'s> {
         Ok(earliest)
     }
 
-    fn consume_next_sample(&mut self, info: &NextSampleInfo) -> Result<Option<SampleDataInfo>> {
+    fn sample_data(&self, info: &NextSampleInfo) -> Result<SampleDataInfo> {
         // Get the track state.
-        let track = &mut self.track_states[info.track_num];
+        let track = &self.track_states[info.track_num];
 
         // Get the segment associated with the sample.
         let seg = &self.segs[info.seg_idx];
@@ -422,14 +424,51 @@ impl<'s> IsoMp4Reader<'s> {
             track.next_sample_pos
         };
 
-        // Advance the track's current segment to the next sample's segment.
+        Ok(SampleDataInfo { pos, len: sample_data_desc.size })
+    }
+
+    fn advance_sample(&mut self, info: &NextSampleInfo, sample: &SampleDataInfo) {
+        let track = &mut self.track_states[info.track_num];
         track.cur_seg = info.seg_idx;
-
-        // Advance the track's next sample number and position.
         track.next_sample += 1;
-        track.next_sample_pos = pos + u64::from(sample_data_desc.size);
+        track.next_sample_pos = sample.pos + u64::from(sample.len);
+    }
 
-        Ok(Some(SampleDataInfo { pos, len: sample_data_desc.size }))
+    fn read_sample<T>(
+        &mut self,
+        read: impl FnOnce(&mut AtomIterator<MediaSourceStream<'s>>, &SampleDataInfo) -> Result<T>,
+    ) -> Result<Option<(NextSampleInfo, T)>> {
+        // Get the index of the track with the next-nearest (minimum) timestamp.
+        let next_sample_info = loop {
+            // Using the current set of segments, try to get the next sample info.
+            if let Some(info) = self.next_sample_info()? {
+                break info;
+            }
+            else {
+                // The inner reader of the atom iterator has been used/seeked around to read
+                // packets, so resync the reader and iterator by seeking to the end of the current
+                // pending atom. Under regular circumstances, no actual expensive seek operation is
+                // performed since the reader should be at the end of the last iterated atom if we
+                // are trying to read another.
+                match self.iter.seek_atom_end() {
+                    Ok(_) | Err(AtomError::NoPendingAtom) => (),
+                    Err(_) => return decode_error("sync lost"),
+                };
+
+                // No more segments. If the stream is unseekable, it may be the case that there are
+                // more segments coming. If the stream is seekable it might be fragmented and no
+                // segments are found in the moov atom. Iterate atoms until a new segment is found
+                // or the end-of-stream is reached
+                if !self.try_read_more_segments()? {
+                    return Ok(None);
+                }
+            }
+        };
+
+        let sample = self.sample_data(&next_sample_info)?;
+        let data = read(&mut self.iter, &sample)?;
+        self.advance_sample(&next_sample_info, &sample);
+        Ok(Some((next_sample_info, data)))
     }
 
     fn try_read_more_segments(&mut self) -> Result<bool> {
@@ -607,45 +646,40 @@ impl FormatReader for IsoMp4Reader<'_> {
     }
 
     fn next_packet(&mut self) -> Result<Option<Packet>> {
-        // Get the index of the track with the next-nearest (minimum) timestamp.
-        let next_sample_info = loop {
-            // Using the current set of segments, try to get the next sample info.
-            if let Some(info) = self.next_sample_info()? {
-                break info;
-            }
-            else {
-                // The inner reader of the atom iterator has been used/seeked around to read
-                // packets, so resync the reader and iterator by seeking to the end of the current
-                // pending atom. Under regular circumstances, no actual expensive seek operation is
-                // performed since the reader should be at the end of the last iterated atom if we
-                // are trying to read another.
-                match self.iter.seek_atom_end() {
-                    Ok(_) | Err(AtomError::NoPendingAtom) => (),
-                    Err(_) => return decode_error("sync lost"),
-                };
+        Ok(self
+            .read_sample(|iter, sample| {
+                Ok(iter.read_raw_boxed_slice_exact(sample.pos, sample.len as usize)?)
+            })?
+            .map(|(info, data)| Packet::new(info.track_id, info.ts, info.dur, data)))
+    }
 
-                // No more segments. If the stream is unseekable, it may be the case that there are
-                // more segments coming. If the stream is seekable it might be fragmented and no
-                // segments are found in the moov atom. Iterate atoms until a new segment is found
-                // or the end-of-stream is reached
-                if !self.try_read_more_segments()? {
-                    return Ok(None);
-                }
-            }
-        };
+    fn packet_buffer_size(&self) -> Result<Option<usize>> {
+        if self.moov.is_fragmented() {
+            return Ok(None);
+        }
+        let size = self
+            .moov
+            .traks
+            .iter()
+            .map(|track| match &track.mdia.minf.stbl.stsz.sample_sizes {
+                SampleSize::Constant(size) => *size,
+                SampleSize::Variable(sizes) => sizes.iter().copied().max().unwrap_or(0),
+            })
+            .max()
+            .unwrap_or(0);
+        Ok(Some(size as usize))
+    }
 
-        // Get the position and length information of the next sample.
-        let sample_info = self.consume_next_sample(&next_sample_info)?.unwrap();
-
-        let data =
-            self.iter.read_raw_boxed_slice_exact(sample_info.pos, sample_info.len as usize)?;
-
-        Ok(Some(Packet::new(
-            next_sample_info.track_id,
-            next_sample_info.ts,
-            next_sample_info.dur,
-            data,
-        )))
+    fn read_packet<'a>(&mut self, buffer: &'a mut [u8]) -> Result<Option<PacketRef<'a>>> {
+        Ok(self
+            .read_sample(|iter, sample| {
+                let data = buffer
+                    .get_mut(..sample.len as usize)
+                    .ok_or(Error::DecodeError("isomp4: packet buffer too small"))?;
+                iter.read_raw_slice_exact(sample.pos, data)?;
+                Ok(&*data)
+            })?
+            .map(|(info, data)| PacketRef::new(info.track_id, info.ts, info.dur, data)))
     }
 
     fn metadata(&mut self) -> Metadata<'_> {
