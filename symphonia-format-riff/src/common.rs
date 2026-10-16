@@ -420,11 +420,26 @@ pub fn next_packet(
         Err(_) => return Ok(None),
     };
 
-    let dur = Duration::from(blocks_per_packet * packet_info.frames_per_block.get());
     let pkt_len = blocks_per_packet * packet_info.block_size.get();
 
     // Copy the frames.
-    let packet_buf = reader.read_boxed_slice(pkt_len as usize)?;
+    let mut packet_buf = reader.read_boxed_slice(pkt_len as usize)?.into_vec();
+    while packet_buf.len() < pkt_len as usize {
+        match reader.read_boxed_slice(pkt_len as usize - packet_buf.len()) {
+            Ok(bytes) if bytes.is_empty() => break,
+            Ok(bytes) => packet_buf.extend_from_slice(&bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if packet_buf.len() as u64 % packet_info.block_size.get() != 0 {
+        return decode_error("riff: incomplete audio block");
+    }
+    let blocks_read = packet_buf.len() as u64 / packet_info.block_size.get();
+    if blocks_read == 0 {
+        return Ok(None);
+    }
+    let dur = Duration::from(blocks_read * packet_info.frames_per_block.get());
 
     Ok(Some(Packet::new(0, pts, dur, packet_buf)))
 }
