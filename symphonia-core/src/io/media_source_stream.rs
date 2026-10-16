@@ -292,14 +292,22 @@ impl io::Read for MediaSourceStream<'_> {
         // than 0, which means the ring buffer was emptied in the first step. Therefore, it is safe
         // to call `read_from_source` which panics if ring buffer is not empty.
         if self.is_large_operation(buf.len() as u64) {
-            buf = self.read_from_source(buf)?;
+            let remaining = buf.len();
+            buf = match self.read_from_source(buf) {
+                Ok(buf) => buf,
+                Err(_) if remaining < read_len => return Ok(read_len - remaining),
+                Err(error) => return Err(error),
+            };
         }
         else {
             // Or, continuously buffer data into the ring buffer from the source, and then read from
             // the ring buffer.
             while !buf.is_empty() {
                 // Refill the the ring buffer as required.
-                self.refill_buffer()?;
+                if let Err(error) = self.refill_buffer() {
+                    let consumed = read_len - buf.len();
+                    return if consumed > 0 { Ok(consumed) } else { Err(error) };
+                }
 
                 // Consume bytes from the readable portion of the ring buffer and copy them into the
                 // remaining portion of the caller's buffer.
@@ -566,6 +574,98 @@ impl SeekBuffered for MediaSourceStream<'_> {
 mod tests {
     use super::{MediaSourceStream, ReadBytes, SeekBuffered};
     use std::io::{Cursor, Read};
+
+    struct ReadGate {
+        bytes: Cursor<Box<[u8]>>,
+        boundary: u64,
+        error: std::io::ErrorKind,
+        blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Read for ReadGate {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.blocked.load(std::sync::atomic::Ordering::Relaxed) {
+                let remaining = self.boundary.saturating_sub(self.bytes.position());
+                if remaining == 0 {
+                    return Err(self.error.into());
+                }
+                let count = buf.len().min(remaining as usize);
+                return self.bytes.read(&mut buf[..count]);
+            }
+            self.bytes.read(buf)
+        }
+    }
+
+    impl std::io::Seek for ReadGate {
+        fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    impl super::MediaSource for ReadGate {
+        fn is_seekable(&self) -> bool {
+            false
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    fn read_gate(
+        data: Box<[u8]>,
+        boundary: u64,
+        error: std::io::ErrorKind,
+    ) -> (MediaSourceStream<'static>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let blocked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let source =
+            ReadGate { bytes: Cursor::new(data), boundary, error, blocked: blocked.clone() };
+        (MediaSourceStream::new(Box::new(source), Default::default()), blocked)
+    }
+
+    #[test]
+    fn verify_mss_buffered_read_reports_progress_before_source_error() {
+        use std::io::ErrorKind::{Interrupted, PermissionDenied, WouldBlock};
+        for error in [Interrupted, WouldBlock, PermissionDenied] {
+            let data = generate_random_bytes(128);
+            let (mut mss, blocked) = read_gate(data.clone(), 53, error);
+            let mut output = [0; 128];
+            assert_eq!(mss.read(&mut output).unwrap(), 53);
+            assert_eq!(&output[..53], &data[..53]);
+            assert_eq!(mss.pos(), 53);
+            assert_eq!(mss.read(&mut output).unwrap_err().kind(), error);
+            assert_eq!(mss.pos(), 53);
+            blocked.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(mss.read(&mut output).unwrap(), 75);
+            assert_eq!(&output[..75], &data[53..]);
+            assert_eq!(mss.pos(), 128);
+            assert_eq!(mss.read(&mut output).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn verify_mss_direct_read_reports_buffered_prefix_before_source_error() {
+        use std::io::ErrorKind::{Interrupted, PermissionDenied, WouldBlock};
+        for error in [Interrupted, WouldBlock, PermissionDenied] {
+            let data = generate_random_bytes(2048);
+            let (mut mss, blocked) = read_gate(data.clone(), 1024, error);
+            assert_eq!(mss.read_byte().unwrap(), data[0]);
+            let mut output = vec![0; 2 * mss.ring.len() + 1024];
+            assert_eq!(mss.read(&mut output).unwrap(), 1023);
+            assert_eq!(&output[..1023], &data[1..1024]);
+            assert_eq!(mss.pos(), 1024);
+            assert_eq!(mss.read(&mut output).unwrap_err().kind(), error);
+            assert_eq!(mss.pos(), 1024);
+            blocked.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(mss.read(&mut output).unwrap(), 1024);
+            assert_eq!(&output[..1024], &data[1024..]);
+            assert_eq!(mss.pos(), 2048);
+            assert_eq!(mss.read(&mut output).unwrap(), 0);
+        }
+    }
 
     /// Generate a random vector of bytes of the specified length using a PRNG.
     fn generate_random_bytes(len: usize) -> Box<[u8]> {
